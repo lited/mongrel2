@@ -45,22 +45,36 @@
 #include "setting.h"
 #include "pattern.h"
 #include "config/config.h"
+#include "unixy.h"
 #include <signal.h>
+#include "mbedtls/config.h"
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/dhm.h>
 
 darray_t *SERVER_QUEUE = NULL;
 int RUNNING=1;
 
-static char *ssl_default_dhm_P = 
-    "E4004C1F94182000103D883A448B3F80" \
-    "2CE4B44A83301270002C20D0321CFD00" \
-    "11CCEF784C26A400F43DFB901BCA7538" \
-    "F2C6B176001CF5A0FD16D2C48B1D0C1C" \
-    "F6AC8E1DA6BCC3B4E1F96B0564965300" \
-    "FFA1D0B601EB2800F489AA512C4B248C" \
-    "01F76949A60BB7F00A40B1EAB64BDD48" \
-    "E8A700D60B7F1200FA8E77B0A979DABF";
+typedef struct CipherName
+{
+    char *name;
+    int id;
+} CipherName;
 
-static char *ssl_default_dhm_G = "4";
+// List of old names for ciphers
+static CipherName legacy_cipher_table[] =
+{
+    { "SSL-RSA-DES-168-SHA",          MBEDTLS_TLS_RSA_WITH_3DES_EDE_CBC_SHA },
+    { "SSL-EDH-RSA-DES-168-SHA",      MBEDTLS_TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA },
+    { "SSL-RSA-AES-128-SHA",          MBEDTLS_TLS_RSA_WITH_AES_128_CBC_SHA },
+    { "SSL-EDH-RSA-AES-128-SHA",      MBEDTLS_TLS_DHE_RSA_WITH_AES_128_CBC_SHA },
+    { "SSL-RSA-AES-256-SHA",          MBEDTLS_TLS_RSA_WITH_AES_256_CBC_SHA },
+    { "SSL-EDH-RSA-AES-256-SHA",      MBEDTLS_TLS_DHE_RSA_WITH_AES_256_CBC_SHA },
+    { "SSL-RSA-CAMELLIA-128-SHA",     MBEDTLS_TLS_RSA_WITH_CAMELLIA_128_CBC_SHA },
+    { "SSL-RSA-CAMELLIA-256-SHA",     MBEDTLS_TLS_RSA_WITH_CAMELLIA_256_CBC_SHA },
+
+    // End of the cipher list
+    { NULL, -1 }
+};
 
 void host_destroy_cb(Route *r, RouteMap *map)
 {
@@ -74,51 +88,53 @@ void host_destroy_cb(Route *r, RouteMap *map)
 
 static int Server_load_ciphers(Server *srv, bstring ssl_ciphers_val)
 {
+    const struct tagbstring bstr_underscore = bsStatic("_");
+    const struct tagbstring bstr_dash = bsStatic("-");
+
     struct bstrList *ssl_cipher_list = bsplit(ssl_ciphers_val, ' ');
-    int i = 0;
-    int max_num_ciphers = 0;
+    int i = 0, n = 0;
     int *ciphers = NULL;
 
     check(ssl_cipher_list != NULL && ssl_cipher_list->qty > 0,
             "Invalid cipher list, it must be separated by space ' ' characters "
             "and you need at least one.  Or, just leave it out for defaults.");
 
-    while(ssl_default_ciphersuites[max_num_ciphers] != 0) {
-        max_num_ciphers++;
-    }
-
-    ciphers = h_calloc(max_num_ciphers + 1, sizeof(int));
+    ciphers = h_calloc(ssl_cipher_list->qty + 1, sizeof(int));
     check_mem(ciphers);
 
     for(i = 0; i < ssl_cipher_list->qty; i++) {
         bstring cipher = ssl_cipher_list->entry[i];
 
-        if(biseqcstr(cipher, "SSL_RSA_RC4_128_MD5"))
-            ciphers[i] = SSL_RSA_RC4_128_MD5;
-        else if(biseqcstr(cipher, "SSL_RSA_RC4_128_SHA"))
-            ciphers[i] = SSL_RSA_RC4_128_SHA;
-        else if(biseqcstr(cipher, "SSL_RSA_DES_168_SHA"))
-            ciphers[i] = SSL_RSA_DES_168_SHA;
-        else if(biseqcstr(cipher, "SSL_EDH_RSA_DES_168_SHA"))
-            ciphers[i] = SSL_EDH_RSA_DES_168_SHA;
-        else if(biseqcstr(cipher, "SSL_RSA_AES_128_SHA"))
-            ciphers[i] = SSL_RSA_AES_128_SHA;
-        else if(biseqcstr(cipher, "SSL_EDH_RSA_AES_128_SHA"))
-            ciphers[i] = SSL_EDH_RSA_AES_128_SHA;
-        else if(biseqcstr(cipher, "SSL_RSA_AES_256_SHA"))
-            ciphers[i] = SSL_RSA_AES_256_SHA;
-        else if(biseqcstr(cipher, "SSL_EDH_RSA_AES_256_SHA"))
-            ciphers[i] = SSL_EDH_RSA_AES_256_SHA;
-        else if(biseqcstr(cipher, "SSL_RSA_CAMELLIA_128_SHA"))
-            ciphers[i] = SSL_RSA_CAMELLIA_128_SHA;
-        else if(biseqcstr(cipher, "SSL_EDH_RSA_CAMELLIA_128_SHA"))
-            ciphers[i] = SSL_EDH_RSA_CAMELLIA_128_SHA;
-        else if(biseqcstr(cipher, "SSL_RSA_CAMELLIA_256_SHA"))
-            ciphers[i] = SSL_RSA_CAMELLIA_256_SHA;
-        else if(biseqcstr(cipher, "SSL_EDH_RSA_CAMELLIA_256_SHA"))
-            ciphers[i] = SSL_EDH_RSA_CAMELLIA_256_SHA;
+        int id = -1;
+
+        // Replace underscores (used in old ciphers) with dashes
+        bfindreplace(cipher, &bstr_underscore, &bstr_dash, 0);
+
+        // Search legacy cipher list
+        for(n = 0; legacy_cipher_table[n].name != NULL; ++n)
+        {
+            if(biseqcstr(cipher, legacy_cipher_table[n].name))
+            {
+                id = legacy_cipher_table[n].id;
+                break;
+            }
+        }
+
+        if(id != -1 && mbedtls_ssl_ciphersuite_from_id(id) != NULL)
+        {
+            ciphers[i] = id;
+        }
         else
-            sentinel("Unrecognized cipher: %s", bdata(cipher));
+        {
+            // Search polarssl cipher list
+            const mbedtls_ssl_ciphersuite_t * suite =
+                mbedtls_ssl_ciphersuite_from_string(bdata(cipher));
+
+            if (suite != NULL)
+                ciphers[i] = suite->id;
+            else
+                sentinel("Unrecognized cipher: %s", bdata(cipher));
+        }
     }
 
     bstrListDestroy(ssl_cipher_list);
@@ -133,15 +149,58 @@ error:
     return -1;
 }
 
+int Server_init_rng(Server *srv)
+{
+    int rc;
+    unsigned char buf[MBEDTLS_ENTROPY_BLOCK_SIZE];
+    void *ctx = NULL;
+
+    mbedtls_entropy_init( &srv->entropy );
+
+    // test the entropy source
+    rc = mbedtls_entropy_func(&srv->entropy, buf, MBEDTLS_ENTROPY_BLOCK_SIZE);
+
+    if(rc == 0) {
+        ctx = calloc(sizeof(mbedtls_ctr_drbg_context), 1);
+
+        mbedtls_ctr_drbg_init((mbedtls_ctr_drbg_context *)ctx);
+        rc = mbedtls_ctr_drbg_seed((mbedtls_ctr_drbg_context *)ctx,
+            mbedtls_entropy_func, &srv->entropy, NULL, 0);
+        check(rc == 0, "Init rng failed: ctr_drbg_init returned %d\n", rc);
+
+        srv->rng_func = mbedtls_ctr_drbg_random;
+        srv->rng_ctx = ctx;
+    } else {
+        log_warn("entropy source unavailable. falling back to havege rng");
+
+        ctx = calloc(sizeof(mbedtls_havege_state), 1);
+        mbedtls_havege_init((mbedtls_havege_state *)ctx);
+
+        srv->rng_func = mbedtls_havege_random;
+        srv->rng_ctx = ctx;
+    }
+
+    return 0;
+error:
+    if(ctx != NULL) free(ctx);
+    return -1;
+}
 
 static int Server_init_ssl(Server *srv)
 {
     int rc = 0;
+    bstring certdir = NULL;
     bstring certpath = NULL;
     bstring keypath = NULL;
-    
-    bstring certdir = Setting_get_str("certdir", NULL);
-    check(certdir != NULL, "to use ssl, you must specify a certdir");
+
+    bstring certdir_setting = Setting_get_str("certdir", NULL);
+    check(certdir_setting != NULL, "to use ssl, you must specify a certdir");
+
+    if(srv->chroot != NULL && !Unixy_in_chroot()) {
+        certdir = bformat("%s%s", bdata(srv->chroot), bdata(certdir_setting));
+    } else {
+        certdir = bstrcpy(certdir_setting);
+    }
 
     certpath = bformat("%s%s.crt", bdata(certdir), bdata(srv->uuid)); 
     check_mem(certpath);
@@ -149,31 +208,46 @@ static int Server_init_ssl(Server *srv)
     keypath = bformat("%s%s.key", bdata(certdir), bdata(srv->uuid));
     check_mem(keypath);
 
-    rc = x509parse_crtfile(&srv->own_cert, bdata(certpath));
+    rc = mbedtls_x509_crt_parse_file(&srv->own_cert, bdata(certpath));
     check(rc == 0, "Failed to load cert from %s", bdata(certpath));
 
-    rc = x509parse_keyfile(&srv->rsa_key, bdata(keypath), NULL);
+    rc = mbedtls_pk_parse_keyfile(&srv->pk_key, bdata(keypath), NULL);
     check(rc == 0, "Failed to load key from %s", bdata(keypath));
 
     bstring ssl_ciphers_val = Setting_get_str("ssl_ciphers", NULL);
+    
+    bstring ca_chain = Setting_get_str("ssl.ca_chain", NULL);
+
+    if ( ca_chain != NULL ) {
+
+        rc = mbedtls_x509_crt_parse_file(&srv->ca_chain, bdata(ca_chain));
+        check(rc == 0, "Failed to load cert from %s", bdata(ca_chain));
+
+    } else {
+        
+        //to indicate no ca_chain was loaded
+        srv->ca_chain.version=-1;
+    }
 
     if(ssl_ciphers_val != NULL) {
         rc = Server_load_ciphers(srv, ssl_ciphers_val);
         check(rc == 0, "Failed to load requested SSL ciphers.");
     } else {
-        srv->ciphers = ssl_default_ciphersuites;
+        srv->ciphers = mbedtls_ssl_list_ciphersuites();
     }
 
-    srv->dhm_P = ssl_default_dhm_P;
-    srv->dhm_G = ssl_default_dhm_G;
+    srv->dhm_P = MBEDTLS_DHM_RFC5114_MODP_2048_P;
+    srv->dhm_G = MBEDTLS_DHM_RFC5114_MODP_2048_G;
 
+    bdestroy(certdir);
     bdestroy(certpath);
     bdestroy(keypath);
 
     return 0;
 
 error:
-    // Do not free certfile, as we're pulling it from Settings
+    // Do not free certdir_setting, as we're pulling it from Settings
+    if(certdir != NULL) bdestroy(certdir);
     if(certpath != NULL) bdestroy(certpath);
     if(keypath != NULL) bdestroy(keypath);
     return -1;
@@ -181,7 +255,7 @@ error:
 
 Server *Server_create(bstring uuid, bstring default_host,
         bstring bind_addr, int port, bstring chroot, bstring access_log,
-        bstring error_log, bstring pid_file, int use_ssl)
+        bstring error_log, bstring pid_file, bstring control_port, int use_ssl)
 {
     Server *srv = NULL;
     int rc = 0;
@@ -201,10 +275,27 @@ Server *Server_create(bstring uuid, bstring default_host,
 
     srv->bind_addr = bstrcpy(bind_addr); check_mem(srv->bind_addr);
     srv->uuid = bstrcpy(uuid); check_mem(srv->uuid);
-    srv->chroot = bstrcpy(chroot); check_mem(srv->chroot);
+
+    // TODO: once mbedtls supports opening urandom early and keeping it open,
+    //   put the rng initialization back here (before chroot)
+    //if(use_ssl) {
+    //    rc = Server_init_rng(srv);
+    //    check(rc == 0, "Failed to initialize rng for server %s", bdata(uuid));
+    //}
+
+    if(blength(chroot) > 0) {
+        srv->chroot = bstrcpy(chroot); check_mem(srv->chroot);
+    } else {
+        srv->chroot = NULL;
+    }
     srv->access_log = bstrcpy(access_log); check_mem(srv->access_log);
     srv->error_log = bstrcpy(error_log); check_mem(srv->error_log);
     srv->pid_file = bstrcpy(pid_file); check_mem(srv->pid_file);
+    if(blength(control_port) > 0) {
+        srv->control_port = bstrcpy(control_port); check_mem(srv->control_port);
+    } else {
+        srv->control_port = NULL;
+    }
     srv->default_hostname = bstrcpy(default_host);
     srv->use_ssl = use_ssl;
     srv->created_on = time(NULL);
@@ -238,8 +329,10 @@ void Server_destroy(Server *srv)
 {
     if(srv) {
         if(srv->use_ssl) {
-            x509_free(&srv->own_cert);
-            rsa_free(&srv->rsa_key);
+            free(srv->rng_ctx);
+
+            mbedtls_x509_crt_free(&srv->own_cert);
+            mbedtls_pk_free(&srv->pk_key);
             // srv->ciphers freed (if non-default) by h_free
         }
 
@@ -252,6 +345,7 @@ void Server_destroy(Server *srv)
         bdestroy(srv->access_log);
         bdestroy(srv->error_log);
         bdestroy(srv->pid_file);
+        bdestroy(srv->control_port);
         bdestroy(srv->default_hostname);
 
         if(srv->listen_fd >= 0) fdclose(srv->listen_fd);
@@ -283,8 +377,9 @@ static inline int Server_accept(int listen_fd)
     char remote[IPADDR_SIZE];
     int rc = 0;
     Connection *conn = NULL;
+    int enable_keepalive = Setting_get_int("net.tcp_keepalive", 0);
 
-    cfd = netaccept(listen_fd, remote, &rport);
+    cfd = netaccept(listen_fd, remote, &rport, enable_keepalive);
     check(cfd >= 0, "Failed to accept on listening socket.");
 
     Server *srv = Server_queue_latest();

@@ -7,16 +7,18 @@
 #include "connection.h"
 
 static const char *RFC_822_TIME = "%a, %d %b %y %T";
+Connection *conn=NULL;
 
 char *test_Request_payloads()
 {
     glob_t test_files;
     bstring fake_sender = bfromcstr("FAKESENDER");
     Request *req = Request_create();
+    //Connection *conn=Connection_create(NULL,0,1,"");
     size_t nparsed = 0;
     unsigned int i = 0;
     int rc = glob("tests/and_suite/*", 0, NULL, &test_files);
-    mu_assert(rc == 0, "Failed to glob file sin tests/and_suite/*");
+    mu_assert(rc == 0, "Failed to glob files in tests/and_suite/*");
     FILE *test_cases = fopen("tests/request_payloads.txt", "w");
     mu_assert(test_cases != NULL, "Failed to create the tests/request_payloads.txt file.");
 
@@ -38,12 +40,12 @@ char *test_Request_payloads()
             // TODO: fix this up so that we never get a null for path
             if(req->path == NULL) req->path = bfromcstr("/");
 
-            bstring payload = Request_to_payload(req, fake_sender, 0, "", 0);
+            bstring payload = Request_to_payload(req, fake_sender, 0, "", 0,conn, NULL);
             bconchar(payload, '\n');
             fwrite(payload->data, blength(payload), 1, test_cases);
             bdestroy(payload);
 
-            payload = Request_to_tnetstring(req, fake_sender, 0, "", 0);
+            payload = Request_to_tnetstring(req, fake_sender, 0, "", 0,conn, NULL);
             debug("TNETSTRING PAYLOAD: '%.*s'", blength(payload), bdata(payload));
             bconchar(payload, '\n');
             fwrite(payload->data, blength(payload), 1, test_cases);
@@ -132,11 +134,11 @@ char *test_Request_create()
     mu_assert(rc == 1, "It should parse.");
     mu_assert(nparsed > 0, "Should have parsed something.");
 
-    bstring payload = Request_to_payload(req, fake_sender, 0, "", 0);
+    bstring payload = Request_to_payload(req, fake_sender, 0, "", 0,conn, NULL);
     debug("PAYLOAD IS: %s", bdata(payload));
     bdestroy(payload);
 
-    payload = Request_to_tnetstring(req, fake_sender, 0, "", 0);
+    payload = Request_to_tnetstring(req, fake_sender, 0, "", 0,conn, NULL);
     debug("TNETSTRING PAYLOAD: '%.*s'", blength(payload), bdata(payload));
 
     mu_assert(Request_get(req, &HTTP_IF_MODIFIED_SINCE) != NULL,
@@ -164,8 +166,61 @@ char *test_Request_create()
     return NULL;
 }
 
+char *test_Request_relaxed()
+{
+    Request *req;
+    int rc = 0;
+    size_t nparsed;
+    bstring fake_sender = bfromcstr("FAKESENDER");
+
+    Request_init();
+
+    FILE *infile = fopen("tests/requests/relaxed_test", "r");
+    mu_assert(infile != NULL, "Failed to open test file.");
+
+    bstring data = bread((bNread)fread, infile);
+    fclose(infile);
+    mu_assert(data != NULL, "Failed to read test file.");
+    mu_assert(blength(data) > 0, "Nothing in that file.");
+
+    // first, test with non-relaxed parsing and fail
+
+    nparsed = 0;
+    req = Request_create();
+    mu_assert(req != NULL, "Failed to create parser for request.");
+
+    Request_start(req);
+
+    rc = Request_parse(req, bdata(data), blength(data), &nparsed);
+
+    mu_assert(rc == -1, "It should fail to parse.");
+
+    Request_destroy(req);
+
+    // next, test with relaxed parsing and succeed
+
+    nparsed = 0;
+    req = Request_create();
+    mu_assert(req != NULL, "Failed to create parser for request.");
+
+    Request_set_relaxed(req, 1);
+    Request_start(req);
+
+    rc = Request_parse(req, bdata(data), blength(data), &nparsed);
+
+    mu_assert(rc == 1, "It should parse.");
+    mu_assert(nparsed > 0, "Should have parsed something.");
+
+    Request_destroy(req);
+
+    bdestroy(fake_sender);
+    bdestroy(data);
+
+    return NULL;
+}
+
 struct tagbstring COOKIE_HEADER = bsStatic("cookie");
-struct tagbstring EXPECTED_COOKIE_HEADER = bsStatic("JSON 1 / 97:{\"PATH\":\"/\",\"cookie\":[\"foo=bar\",\"test=yes; go=no\"],\"METHOD\":\"GET\",\"VERSION\":\"HTTP/1.0\",\"URI\":\"/\"},0:,");
+struct tagbstring EXPECTED_COOKIE_HEADER = bsStatic("JSON 1 / 134:{\"PATH\":\"/\",\"cookie\":[\"foo=bar\",\"test=yes; go=no\"],\"METHOD\":\"GET\",\"VERSION\":\"HTTP/1.0\",\"URI\":\"/\",\"URL_SCHEME\":\"http\",\"REMOTE_ADDR\":\"\"},0:,");
 
 char *test_Multiple_Header_Request() 
 {
@@ -195,7 +250,7 @@ char *test_Multiple_Header_Request()
     mu_assert(Request_get(req, &COOKIE_HEADER) != NULL,
             "Should have an cookie header.");
 
-    bstring payload = Request_to_payload(req, &JSON_METHOD, 0, "", 0);
+    bstring payload = Request_to_payload(req, &JSON_METHOD, 0, "", 0,conn, NULL);
     debug("PAYLOAD IS: %s", bdata(payload));
 
     mu_assert(bstrcmp(payload, &EXPECTED_COOKIE_HEADER) == 0,
@@ -214,12 +269,14 @@ char * all_tests() {
     Register_init();
 
     // some evil hackery to mock out a registration so that the payload functions work
-    Connection *conn = calloc(sizeof(Connection), 1);
+    conn = Connection_create(NULL,0,1,"");
+    /*Connection *conn = calloc(sizeof(Connection), 1);
     conn->iob = NULL;
-    conn->type = CONN_TYPE_HTTP;
+    conn->type = CONN_TYPE_HTTP;*/
     Register_connect(0, conn);
 
     mu_run_test(test_Request_create);
+    mu_run_test(test_Request_relaxed);
     mu_run_test(test_Multiple_Header_Request);
     mu_run_test(test_Request_payloads);
     mu_run_test(test_Request_speeds);

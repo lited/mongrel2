@@ -38,6 +38,7 @@
 #include <bstring.h>
 
 extern struct tagbstring HTTP_CONTENT_LENGTH;
+extern struct tagbstring HTTP_TRANSFER_ENCODING;
 extern struct tagbstring HTTP_HOST;
 extern struct tagbstring HTTP_METHOD;
 extern struct tagbstring HTTP_VERSION;
@@ -63,5 +64,10 @@ extern struct tagbstring HTTP_USER_AGENT;
 extern struct tagbstring HTTP_CONNECTION;
 extern struct tagbstring HTTP_X_FORWARDED_FOR;
 extern struct tagbstring HTTP_EXPECT;
+extern struct tagbstring HTTP_URL_SCHEME;
+extern struct tagbstring HTTP_HTTP;
+extern struct tagbstring HTTP_HTTPS;
+extern struct tagbstring HTTP_REMOTE_ADDR;
+extern struct tagbstring DOWNLOAD_CREDITS;
 
 #endif

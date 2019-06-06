@@ -39,9 +39,10 @@
 #include "adt/darray.h"
 #include "host.h"
 #include "routing.h"
-#include "polarssl/ssl.h"
-#include "polarssl/x509.h"
-#include "polarssl/rsa.h"
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/x509.h>
+#include <mbedtls/pk.h>
 
 enum {
      /* IPv6 addr can be up to 40 chars long */
@@ -62,19 +63,25 @@ typedef struct Server {
     bstring access_log;
     bstring error_log;
     bstring pid_file;
+    bstring control_port;
     bstring default_hostname;
     uint32_t created_on;
     int use_ssl;
-    x509_cert own_cert;
-    rsa_context rsa_key;
-    int *ciphers;
+    mbedtls_entropy_context entropy;
+    int (*rng_func)(void *, unsigned char *, size_t);
+    void *rng_ctx;
+    mbedtls_x509_crt own_cert;
+    mbedtls_x509_crt ca_chain;
+    mbedtls_pk_context pk_key;
+    const int *ciphers;
     char *dhm_P;
     char *dhm_G;
 } Server;
 
 Server *Server_create(bstring uuid, bstring default_host,
         bstring bind_addr, int port, bstring chroot,
-        bstring access_log, bstring error_log, bstring pid_file, int use_ssl);
+        bstring access_log, bstring error_log, bstring pid_file,
+        bstring control_port, int use_ssl);
 
 void Server_destroy(Server *srv);
 
@@ -101,5 +108,7 @@ void Server_queue_push(Server *srv);
 #define Server_queue_latest() darray_last(SERVER_QUEUE)
 
 int Server_queue_destroy();
+
+int Server_init_rng(Server *srv);
 
 #endif

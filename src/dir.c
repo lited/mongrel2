@@ -31,8 +31,8 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#undef NDEBUG
 
-#define _FILE_OFFSET_BITS 64
 #include <dir.h>
 #include <cache.h>
 #include <fcntl.h>
@@ -83,7 +83,7 @@ static void filerecord_cache_evict(void *data) {
 static inline int get_file_real_size(FileRecord *fr)
 {
     // TODO: this is the total suck we'll redesign this away
-    int fd = open(bdata(fr->full_path), O_RDONLY);
+    int fd = open(bdatae(fr->full_path,""), O_RDONLY);
     check(fd >= 0, "Failed to open file but stat worked: %s", bdata(fr->full_path));
 
     fr->file_size = lseek(fd, 0L, SEEK_END);
@@ -94,8 +94,9 @@ static inline int get_file_real_size(FileRecord *fr)
 
     return 0;
 error:
-
-    fdclose(fd);
+    if (fd>=0) {
+        fdclose(fd);
+    }
     return -1;
 }
 
@@ -111,7 +112,7 @@ FileRecord *Dir_find_file(bstring path, bstring default_type)
     fr->users = 1;
     fr->full_path = path;
 
-    int rc = stat(bdata(fr->full_path), &fr->sb);
+    int rc = stat(bdatae(fr->full_path,""), &fr->sb);
     check(rc == 0, "File stat failed: %s", bdata(fr->full_path));
 
     if(S_ISDIR(fr->sb.st_mode)) {
@@ -167,10 +168,11 @@ long long int Dir_stream_file(FileRecord *file, Connection *conn)
     int rc = Dir_send_header(file, conn);
     check_debug(rc, "Failed to write header to socket.");
 
-    fd = open(bdata(file->full_path), O_RDONLY);
+    fd = open(bdatae(file->full_path,""), O_RDONLY);
     check(fd >= 0, "Failed to open file: %s", bdata(file->full_path));
 
     sent = IOBuf_stream_file(conn->iob, fd, file->file_size);
+    check(sent == file->file_size, "Error streaming file. Sent %d of %d bytes.", sent, file->file_size);
 
     fdclose(fd);
     return file->file_size;
@@ -197,7 +199,6 @@ Dir *Dir_create(bstring base, bstring index_file, bstring default_ctype, int cac
 
     dir->base = bstrcpy(base);
     check(blength(dir->base) < MAX_DIR_PATH, "Base directory is too long, must be less than %d", MAX_DIR_PATH);
-    check(bchar(dir->base, 0) != '/', "Don't start the base with / in %s, that will fail when not in chroot.", bdata(base));
     check(bchar(dir->base, blength(dir->base) - 1) == '/', "End directory base with / in %s or it won't work right.", bdata(base));
 
     dir->index_file = bstrcpy(index_file);
@@ -261,87 +262,118 @@ void FileRecord_destroy(FileRecord *file)
     }
 }
 
-static inline char *url_decode(const char *in, char *out)
+static inline void burl_decode(bstring b)
 {
-  const char *cur; /* will seek % in input */
-  char d1; /* will contain candidate for 1st digit */
-  char d2; /* will contain candidate for 2nd digit */
-  char *res = out; /* just for convienience */
+    char d1; /* will contain candidate for 1st digit */
+    char d2; /* will contain candidate for 2nd digit */
+    char *cur = bdata(b);
+    char *out = bdata(b);
+    char *end = cur+blength(b);
 
-  if(!in) {
-    *out = '\0';
-    return res;
-  }
-
-  cur = in;
-
-  while(*cur) {
-    d1 = *(cur+1);
-    d2 = *(cur+2);
-
-    /* One character left in input */
-    if(!d1) {
-      *out = *cur;
-      *(out+1) = '\0';
-      return res;
+    if(blength(b) == 0) {
+        return;
     }
 
-    /* Two characters left in input */
-    if(!d2) {
-      *out = *cur;
-      *(out+1) = *(cur+1);
-      *(out+2) = '\0';
-      return res;
+    while(cur < end) {
+        /* One character left in input */
+        if (cur + 1 == end) {
+            *out = *cur;
+            *(out+1) = '\0';
+            btrunc(b,out + 1 - bdata(b));
+            return;
+        }
+        d1 = *(cur+1);
+
+        /* Two characters left in input */
+        if (cur + 2 == end) {
+            *out = *cur;
+            *(out+1) = *(cur+1);
+            *(out+2) = '\0';
+            btrunc(b,out + 2 - bdata(b));
+            return;
+        }
+
+        d2 = *(cur+2);
+
+        /* Legal escape sequence */
+        if(*cur=='%' && isxdigit(d1) && isxdigit(d2)) {
+            d1 = tolower(d1);
+            d2 = tolower(d2);
+
+            if( d1 <= '9' )
+                d1 = d1 - '0';
+            else
+                d1 = d1 - 'a' + 10;
+            if( d2 <= '9' )
+                d2 = d2 - '0';
+            else
+                d2 = d2 - 'a' + 10;
+
+            *out = 16 * d1 + d2;
+
+            out += 1;
+            cur += 3;
+        }
+        else {
+            *out = *cur;
+            out += 1;
+            cur += 1;
+        }
     }
 
-    /* Legal escape sequence */
-    if(*cur=='%' && isxdigit(d1) && isxdigit(d2)) {
-      d1 = tolower(d1);
-      d2 = tolower(d2);
-
-      if( d1 <= '9' )
-        d1 = d1 - '0';
-      else
-        d1 = d1 - 'a' + 10;
-      if( d2 <= '9' )
-        d2 = d2 - '0';
-      else
-        d2 = d2 - 'a' + 10;
-
-      *out = 16 * d1 + d2;
-
-      out += 1;
-      cur += 3;
-    }
-    else {
-      *out = *cur;
-      out += 1;
-      cur += 1;
-    }
-  }
-
-  *out = '\0';
-  return res;
+    check(0, "Bug in burl_decode: unreachable line reached");
+error:
+    btrunc(b,out - bdata(b));
+    return;
 }
+
+/* realpath() in older versions of POSIX was ill-specified if PATH_MAX is not
+ * defined.  Newer versions of POSIX allow passing NULL as the second argument
+ * so the most portable thing to do is to use a buffer if PATH_MAX is defined
+ * and NULL if it is not defined. */
+static bstring brealpath(bstring target)
+{
+#ifdef PATH_MAX
+    bstring returnme = bfromcstralloc(PATH_MAX+1,"X");
+    bpattern(returnme,PATH_MAX);
+    char *normalized = realpath((const char *)(bdata(target)),bdata(returnme));
+    check_debug(normalized, "Failed to normalize path: %s %d %s", bdata(target), errno, strerror(errno));
+    //btrunc(returnme,strlen(normalized));
+    btrunc(returnme,strlen(bdata(returnme)));
+#else
+    bstring returnme = NULL;
+    char *normalized = realpath((const char *)(bdata(target)),NULL);
+    check_debug(normalized, "Failed to normalize path: %s %d %s", bdata(target), errno, strerror(errno));
+
+    returnme = bfromcstr(normalized);
+
+    free(normalized);
+#endif
+    return returnme;
+
+error:
+    bdestroy(returnme);
+    return NULL;
+}
+
 
 static inline int normalize_path(bstring target)
 {
-    ballocmin(target, PATH_MAX);
-    static char *path_buf = NULL;
 
-    // Some platforms (OSX!) don't allocate for you, so we have to
-    if(path_buf == NULL) {
-        path_buf = calloc(PATH_MAX+1, 1);
-        check_mem(path_buf);
-    }
 
-    url_decode((const char *)(bdata(target)), path_buf);
-    bassigncstr(target, path_buf);
+    burl_decode(target);
 
-    char *normalized = realpath((const char *)(bdata(target)), path_buf);
+
+
+    bstring normalized = brealpath(target);
+
+
     check_debug(normalized, "Failed to normalize path: %s", bdata(target));
 
-    bassigncstr(target, normalized);
+    check(BSTR_OK == bassign(target, normalized), "Failed to assign target");
+
+    bdestroy(normalized);
+
 
     return 0;
 
@@ -374,17 +406,16 @@ FileRecord *FileRecord_cache_check(Dir *dir, bstring path)
         struct stat sb;
 
         if(difftime(now, file->loaded) > dir->cache_ttl) {
-            int rcstat = stat(p, &sb);
-
-            if(rcstat != 0 ||
-                    file->sb.st_mtime != sb.st_mtime ||
-                    file->sb.st_ctime != sb.st_ctime ||
-                    file->sb.st_uid != sb.st_uid ||
-                    file->sb.st_gid != sb.st_gid ||
-                    file->sb.st_mode != sb.st_mode ||
-                    file->sb.st_size != sb.st_size ||
-                    file->sb.st_ino != sb.st_ino ||
-                    file->sb.st_dev != sb.st_dev 
+            if( p == NULL ||
+                0 != stat(p, &sb) ||
+                file->sb.st_mtime != sb.st_mtime ||
+                file->sb.st_ctime != sb.st_ctime ||
+                file->sb.st_uid != sb.st_uid ||
+                file->sb.st_gid != sb.st_gid ||
+                file->sb.st_mode != sb.st_mode ||
+                file->sb.st_size != sb.st_size ||
+                file->sb.st_ino != sb.st_ino ||
+                file->sb.st_dev != sb.st_dev 
             ) {
                 Cache_evict_object(dir->fr_cache, file);
                 file = NULL;

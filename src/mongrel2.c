@@ -37,6 +37,7 @@
 #include <signal.h>
 #include <time.h>
 #include <assert.h>
+#include <sys/socket.h>
 
 #include "server.h"
 #include "dbg.h"
@@ -52,12 +53,12 @@
 #include "version.h"
 #include "control.h"
 #include "log.h"
+#include "logrotate.h"
 #include "register.h"
 
 extern int RUNNING;
 extern uint32_t THE_CURRENT_TIME_IS;
 int RELOAD = 0;
-int MURDER = 0;
 
 const int TICKER_TASK_STACK = 16 * 1024;
 const int RELOAD_TASK_STACK = 100 * 1024;
@@ -74,7 +75,7 @@ Task *RELOAD_TASK = NULL;
 
 void terminate(int s)
 {
-    MURDER = s == SIGTERM;
+    int murder = 0;
 
     switch(s)
     {
@@ -89,15 +90,17 @@ void terminate(int s)
         default:
             if(!RUNNING) {
                 log_info("SIGINT CAUGHT AGAIN, ASSUMING MURDER.");
-                MURDER = 1;
-            } else {
-                RUNNING = 0;
-                log_info("SHUTDOWN REQUESTED: %s", MURDER ? "MURDER" : "GRACEFUL (SIGINT again to EXIT NOW)");
-                Server *srv = Server_queue_latest();
+                murder = 1;
+            }
+            RUNNING = 0;
+            log_info("SHUTDOWN REQUESTED: %s", murder ? "MURDER" : "GRACEFUL (SIGINT again to EXIT NOW)");
+            if(murder) {
+                exit(s);
+            }
+            Server *srv = Server_queue_latest();
 
-                if(srv != NULL) {
-                    fdclose(srv->listen_fd);
-                }
+            if(srv != NULL) {
+                shutdown(srv->listen_fd,SHUT_RDWR);
             }
             break;
     }
@@ -168,7 +171,12 @@ error:
 
 int clear_pid_file(Server *srv)
 {
-    bstring pid_file = bformat("%s%s", bdata(srv->chroot), bdata(srv->pid_file));
+    bstring pid_file;
+    if(srv->chroot != NULL) {
+        pid_file = bformat("%s%s", bdata(srv->chroot), bdata(srv->pid_file));
+    } else {
+        pid_file = bstrcpy(srv->pid_file);
+    }
 
     int rc = Unixy_remove_dead_pidfile(pid_file);
     check(rc == 0, "Failed to remove the dead PID file: %s", bdata(pid_file));
@@ -219,40 +227,61 @@ int attempt_chroot_drop(Server *srv)
 {
     int rc = 0;
 
-    if(Unixy_chroot(srv->chroot) == 0) {
-        log_info("All loaded up, time to turn into a server.");
-        log_info("-- Starting " VERSION ". Copyright (C) Zed A. Shaw. Licensed BSD.\n");
-        log_info("-- Look in %s for startup messages and errors.", bdata(srv->error_log));
+    log_info("All loaded up, time to turn into a server.");
+    log_info("-- Starting " VERSION ". Copyright (C) Zed A. Shaw. Licensed BSD.\n");
+    log_info("-- Look in %s for startup messages and errors.", bdata(srv->error_log));
 
-        rc = Unixy_daemonize();
-        check(rc == 0, "Failed to daemonize, looks like you're hosed.");
+    int testmode = 0;
 
+    if(srv->chroot != NULL) {
+        if(Unixy_chroot(srv->chroot) == 0) {
+            if(Setting_get_int("server.daemonize", 1)) {
+                rc = Unixy_daemonize(1); // 1 == chdir /
+                check(rc == 0, "Failed to daemonize, looks like you're hosed.");
+            }
+            else {
+                rc = chdir("/");
+                check(rc == 0, "Failed to change working directory to '/'.");
+            }
+        } else {
+            log_warn("Couldn't chroot to %s, assuming running in test mode.", bdata(srv->chroot));
+
+            // rewrite the access log to be in the right location
+            bstring temp = bformat("%s%s", bdata(srv->chroot), bdata(srv->access_log));
+            bassign(srv->access_log, temp);
+            bdestroy(temp);
+
+            temp = bformat(".%s", bdata(srv->pid_file));
+            bassign(srv->pid_file, temp);
+            bdestroy(temp);
+
+            testmode = 1;
+        }
+    } else {
+        if(Setting_get_int("server.daemonize", 1)) {
+            rc = Unixy_daemonize(0); // 0 == don't chdir
+            check(rc == 0, "Failed to daemonize, looks like you're hosed.");
+        }
+    }
+
+    rc = Unixy_pid_file(srv->pid_file);
+    check(rc == 0, "Failed to make the PID file %s", bdata(srv->pid_file));
+
+    if(srv->chroot != NULL && ! testmode) {
+        rc = Unixy_drop_priv(&PRIV_DIR);
+        check(rc == 0, "Failed to drop priv to the owner of %s", bdata(&PRIV_DIR));
+    } else {
+        rc = Unixy_drop_priv(NULL);
+        check(rc == 0, "Failed to drop priv");
+    }
+
+    if(!testmode) {
         FILE *log = fopen(bdata(srv->error_log), "a+");
         check(log, "Couldn't open %s log file.", bdata(srv->error_log));
         setbuf(log, NULL);
+        check(0==add_log_to_rotate_list(srv->error_log,log),"Unable to add error log to list of files to rotate.");
 
         dbg_set_log(log);
-
-        rc = Unixy_pid_file(srv->pid_file);
-        check(rc == 0, "Failed to make the PID file %s", bdata(srv->pid_file));
-
-        rc = Unixy_drop_priv(&PRIV_DIR);
-        check(rc == 0, "Failed to drop priv to the owner of %s", bdata(&PRIV_DIR));
-
-    } else {
-        log_warn("Couldn't chroot too %s, assuming running in test mode.", bdata(srv->chroot));
-
-        // rewrite the access log to be in the right location
-        bstring temp = bformat("%s%s", bdata(srv->chroot), bdata(srv->access_log));
-        bassign(srv->access_log, temp);
-        bdestroy(temp);
-
-        temp = bformat(".%s", bdata(srv->pid_file));
-        bassign(srv->pid_file, temp);
-        bdestroy(temp);
-
-        rc = Unixy_pid_file(srv->pid_file);
-        check(rc == 0, "Failed to make the PID file %s", bdata(srv->pid_file));
     }
 
     return 0;
@@ -274,25 +303,6 @@ void final_setup()
     log_info("-- " VERSION " Running. Copyright (C) Zed A. Shaw. Licensed BSD.");
 }
 
-
-
-Server *reload_server(Server *old_srv, const char *db_file, const char *server_uuid)
-{
-    log_info("------------------------ RELOAD %s -----------------------------------", server_uuid);
-    MIME_destroy();
-    Setting_destroy();
-
-    Server *srv = load_server(db_file, server_uuid, old_srv);
-    check(srv != NULL, "Failed to load new server config.");
-
-    Server_stop_handlers(old_srv);
-
-    RELOAD = 0;
-    return srv;
-
-error:
-    return NULL;
-}
 
 
 void complete_shutdown(Server *srv)
@@ -342,20 +352,20 @@ error:
 void reload_task(void *data)
 {
     RELOAD_TASK = taskself();
-    struct ServerTask *srv = data;
+    (void)data; //struct ServerTask *srv = data;
 
     while(1) {
         taskswitch();
         task_clear_signal();
 
         if(RELOAD) {
-            log_info("Reload requested, will load %s from %s", bdata(srv->db_file), bdata(srv->server_id));
-            Server *old_srv = Server_queue_latest();
-            Server *new_srv = reload_server(old_srv, bdata(srv->db_file), bdata(srv->server_id));
-            check(new_srv, "Failed to load the new configuration, exiting.");
-
-            // for this to work handlers need to die more gracefully
-            Server_queue_push(new_srv);
+            log_info("Rotating logs");
+            if(rotate_logs()) {
+                log_err("Error rotating logs!");
+            }
+            log_info("Flushing SNI cache");
+            Connection_flush_sni_cache();
+            RELOAD = 0;
         } else {
             log_info("Shutdown requested, goodbye.");
             break;
@@ -363,8 +373,8 @@ void reload_task(void *data)
     }
 
     taskexit(0);
-error:
-    taskexit(1);
+//error:
+//    taskexit(1);
 }
 
 void taskmain(int argc, char **argv)
@@ -393,6 +403,13 @@ void taskmain(int argc, char **argv)
 
     rc = attempt_chroot_drop(srv);
     check(rc == 0, "Major failure in chroot/droppriv, aborting."); 
+
+    // set up rng after chroot
+    // TODO: once mbedtls is updated, we can move this back into Server_create
+    if(srv->use_ssl) {
+        rc = Server_init_rng(srv);
+        check(rc == 0, "Failed to initialize rng for server %s", bdata(srv->uuid));
+    }
 
     final_setup();
 

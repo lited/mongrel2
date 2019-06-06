@@ -27,7 +27,13 @@ int darray_push(darray_t *array, void *el);
 
 void *darray_pop(darray_t *array);
 
+int darray_insert(darray_t *array, int i, void *el);
+
 void darray_clear_destroy(darray_t *array);
+
+void darray_move_to_end(darray_t *array, int i);
+
+void darray_remove_and_resize(darray_t *array, int start, int count);
 
 #define darray_last(A) ((A)->contents[(A)->end - 1])
 #define darray_first(A) ((A)->contents[0])

@@ -42,15 +42,23 @@
 #include <connection.h>
 #include <assert.h>
 #include <register.h>
+#include "tnetstrings.h"
+#include "xrequest.h"
 
 #include "setting.h"
 
 struct tagbstring LEAVE_HEADER_JSON = bsStatic("{\"METHOD\":\"JSON\"}");
 struct tagbstring LEAVE_HEADER_TNET = bsStatic("16:6:METHOD,4:JSON,}");
 struct tagbstring LEAVE_MSG = bsStatic("{\"type\":\"disconnect\"}");
-
+struct tagbstring CREDITS_MSG = bsStatic("{\"type\":\"credits\"}");
+struct tagbstring XREQ_CTL = bsStatic("ctl");
+struct tagbstring KEEP_ALIVE = bsStatic("keep-alive");
+struct tagbstring CREDITS = bsStatic("credits");
+struct tagbstring CANCEL = bsStatic("cancel");
 
 int HANDLER_STACK;
+
+static const int PAYLOAD_GUESS = 256;
 
 static void cstr_free(void *data, void *hint)
 {
@@ -87,6 +95,52 @@ error: //fallthrough
     if(payload) free(payload);
 }
 
+void Handler_notify_credits(Handler *handler, int id, int credits)
+{
+    void *socket = handler->send_socket;
+    assert(socket && "Socket can't be NULL");
+    tns_outbuf outbuf = {.buffer = NULL};
+    bstring payload = NULL;
+
+    if(handler->protocol == HANDLER_PROTO_TNET) {
+        int header_start = tns_render_request_start(&outbuf);
+        bstring creditsstr = bformat("%d", credits);
+        tns_render_hash_pair(&outbuf, &HTTP_METHOD, &JSON_METHOD);
+        tns_render_hash_pair(&outbuf, &DOWNLOAD_CREDITS, creditsstr);
+        bdestroy(creditsstr);
+        tns_outbuf_clamp(&outbuf, header_start);
+
+        payload = bformat("%s %d @* %s%d:%s,",
+                bdata(handler->send_ident), id,
+                bdata(tns_outbuf_to_bstring(&outbuf)),
+                blength(&CREDITS_MSG), bdata(&CREDITS_MSG));
+    } else {
+        bstring headers = bfromcstralloc(PAYLOAD_GUESS, "{");
+
+        bcatcstr(headers, "\"METHOD\":\"JSON\",\"");
+        bconcat(headers, &DOWNLOAD_CREDITS);
+        bcatcstr(headers, "\":\"");
+        bformata(headers, "%d", credits);
+        bcatcstr(headers, "\"}");
+
+        payload = bformat("%s %d @* %d:%s,%d:%s,",
+                bdata(handler->send_ident), id,
+                blength(headers), bdata(headers),
+                blength(&CREDITS_MSG), bdata(&CREDITS_MSG));
+
+        bdestroy(headers);
+    }
+
+    check(payload != NULL, "Failed to make the payload for credits.");
+
+    if(Handler_deliver(socket, bdata(payload), blength(payload)) == -1) {
+        log_err("Can't tell handler %d giving credits.", id);
+    }
+
+error: //fallthrough
+    if(payload) free(payload);
+    if(outbuf.buffer) free(outbuf.buffer);
+}
 
 int Handler_setup(Handler *handler)
 {
@@ -134,6 +188,102 @@ static inline int deliver_payload(int raw, int fd, Connection *conn, bstring pay
     return 0;
 error:
     return -1;
+}
+
+static int handler_process_control_request(Connection *conn, tns_value_t *data)
+{
+    tns_value_t *args = darray_get(data->value.list, 1);
+    check(args->type==tns_tag_dict, "Invalid control response: not a dict.");
+
+    hnode_t *n = hash_lookup(args->value.dict, &KEEP_ALIVE);
+    if(n != NULL) {
+        Register_ping(IOBuf_fd(conn->iob));
+    }
+
+    n = hash_lookup(args->value.dict, &CREDITS);
+    if(n != NULL) {
+        tns_value_t *credits = (tns_value_t *)hnode_get(n);
+        conn->sendCredits += credits->value.number;
+        taskwakeup(&conn->uploadRendez);
+    }
+
+    n = hash_lookup(args->value.dict, &CANCEL);
+    if(n != NULL && !conn->closing) {
+        Register_disconnect(IOBuf_fd(conn->iob));
+        taskwakeup(&conn->uploadRendez);
+    }
+
+    tns_value_destroy(data);
+    return 0;
+
+error:
+    return -1;
+}
+
+static tns_value_t *parse_extended_request(bstring payload)
+{
+    char *x;
+    tns_value_t *data = NULL;
+    darray_t *l = NULL;
+
+    data = tns_parse(bdata(payload),blength(payload),&x);
+
+    check((x-bdata(payload))==blength(payload), "Invalid extended response: extra data after tnetstring.");
+    check(data->type==tns_tag_list, "Invalid extended response: not a list.");
+    l = data->value.list;
+    check(darray_end(l)==2, "Invalid extended response: odd number of elements in list.");
+    tns_value_t *key=darray_get(l,0);
+    check(key->type==tns_tag_string, "Invalid extended response: key is not a string");
+    check(key->value.string != NULL, "Invalid extended response: key is NULL");
+
+    return data;
+
+error:
+    tns_value_destroy(data);
+    return NULL;
+}
+
+static int is_cancel_request(tns_value_t *data)
+{
+    tns_value_t *key = darray_get(data->value.list, 0);
+    check(key->type == tns_tag_string, "Invalid extended response: key is not a string");
+    check(key->value.string != NULL, "Invalid extended response: key is NULL");
+
+    if(!bstrcmp(key->value.string, &XREQ_CTL)) {
+        tns_value_t *args = darray_get(data->value.list, 1);
+        check(args->type==tns_tag_dict, "Invalid control response: not a dict.");
+
+        hnode_t *n = hash_lookup(args->value.dict, &CANCEL);
+        if(n != NULL) {
+            return 1;
+        }
+    }
+
+error:
+    return 0;
+}
+
+// takes ownership of data on success
+static int handler_process_extended_request(int fd, Connection *conn, tns_value_t *data)
+{
+    tns_value_t *key=darray_get(data->value.list, 0);
+    check(key->type == tns_tag_string, "Invalid extended response: key is not a string");
+    check(key->value.string != NULL, "Invalid extended response: key is NULL");
+
+    if(!bstrcmp(key->value.string, &XREQ_CTL)) {
+        check (0 == handler_process_control_request(conn, data),
+                "Control request processing returned non-zero: %s", bdata(key->value.string));
+    } else {
+        check (0 == dispatch_extended_request(conn, key->value.string, data),
+                "Extended request dispatch returned non-zero: %s",bdata(key->value.string));
+    }
+
+    return 0;
+
+error:
+    tns_value_destroy(data);
+    Register_disconnect(fd); // return ignored
+    return 1;
 }
 
 static inline void handler_process_request(Handler *handler, int id, int fd,
@@ -230,12 +380,32 @@ void Handler_task(void *v)
                 int fd = Register_fd_for_id(id);
                 Connection *conn = fd == -1 ? NULL : Register_fd_exists(fd);
 
+                tns_value_t *ext_req = NULL;
+                if(parser->extended) {
+                    ext_req = parse_extended_request(parser->body);
+                }
+
                 // don't bother calling process request if there's nothing to handle
                 if(conn && fd >= 0) {
-                    handler_process_request(handler, id, fd, conn, parser->body);
+                    if(parser->extended) {
+                        // can be null if failed to parse earlier
+                        if(ext_req != NULL) {
+                            handler_process_extended_request(fd, conn, ext_req);
+                            ext_req = NULL; // took ownership
+                        }
+                    } else {
+                        handler_process_request(handler, id, fd, conn, parser->body);
+                    }
                 } else {
                     // TODO: I believe we need to notify the connection that it is dead too
-                    Handler_notify_leave(handler, id);
+                    if(ext_req == NULL || !is_cancel_request(ext_req)) {
+                        Handler_notify_leave(handler, id);
+                    }
+                }
+
+                if(ext_req != NULL) {
+                    tns_value_destroy(ext_req);
+                    ext_req = NULL;
                 }
             }
         }

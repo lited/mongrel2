@@ -1,5 +1,7 @@
-CFLAGS=-g -O2 -Wall -Wextra -Isrc -pthread -rdynamic -DNDEBUG $(OPTFLAGS) -D_FILE_OFFSET_BITS=64
-LIBS=-lzmq -ldl -lsqlite3 $(OPTLIBS)
+CFLAGS?=-g -O2
+CFLAGS += -Wall -Wextra -I./src -DNDEBUG -D_FILE_OFFSET_BITS=64 -pthread
+CFLAGS += ${OPTFLAGS}
+LIBS+=-lzmq -ldl -lsqlite3 -lmbedtls -lmbedx509 -lmbedcrypto
 PREFIX?=/usr/local
 
 get_objs = $(addsuffix .o,$(basename $(wildcard $(1))))
@@ -8,34 +10,30 @@ ASM=$(wildcard src/**/*.S src/*.S)
 RAGEL_TARGETS=src/state.c src/http11/http11_parser.c
 SOURCES=$(wildcard src/**/*.c src/*.c) $(RAGEL_TARGETS)
 OBJECTS=$(patsubst %.c,%.o,${SOURCES}) $(patsubst %.S,%.o,${ASM})
-OBJECTS_EXTERNAL+=$(call get_objs,src/polarssl/*.c)
 OBJECTS_NOEXT=$(filter-out ${OBJECTS_EXTERNAL},${OBJECTS})
 LIB_SRC=$(filter-out src/mongrel2.c,${SOURCES})
 LIB_OBJ=$(filter-out src/mongrel2.o,${OBJECTS})
 TEST_SRC=$(wildcard tests/*_tests.c)
 TESTS=$(patsubst %.c,%,${TEST_SRC})
-MAKEOPTS=OPTFLAGS="${NOEXTCFLAGS} ${OPTFLAGS}" OPTLIBS="${OPTLIBS}" LIBS="${LIBS}" DESTDIR="${DESTDIR}" PREFIX="${PREFIX}"
+MAKEOPTS=OPTFLAGS="${CFLAGS} ${NOEXTCFLAGS} ${OPTFLAGS}" LIBS="${LIBS}" DESTDIR="${DESTDIR}" PREFIX="${PREFIX}"
 
 all: bin/mongrel2 tests m2sh procer
 
-dev: CFLAGS=-g -Wall -Isrc -Wall -Wextra $(OPTFLAGS) -D_FILE_OFFSET_BITS=64
-dev: all
-
 ${OBJECTS_NOEXT}: CFLAGS += ${NOEXTCFLAGS}
+${OBJECTS}: | builddirs
 
-
-
-bin/mongrel2: build/libm2.a src/mongrel2.o
-	$(CC) $(CFLAGS) src/mongrel2.o -o $@ $< $(LIBS)
-
-build/libm2.a: CFLAGS += -fPIC
-build/libm2.a: build ${LIB_OBJ}
-	ar rcs $@ ${LIB_OBJ}
-	ranlib $@
-
-build:
+.PHONY: builddirs
+builddirs:
 	@mkdir -p build
 	@mkdir -p bin
+
+bin/mongrel2: build/libm2.a src/mongrel2.o
+	$(CC) $(CFLAGS) $(LDFLAGS) src/mongrel2.o -o $@ $< $(LIBS)
+
+build/libm2.a: CFLAGS += -fPIC
+build/libm2.a: ${LIB_OBJ}
+	ar rcs $@ ${LIB_OBJ}
+	ranlib $@
 
 clean:
 	rm -rf build bin lib ${OBJECTS} ${TESTS} tests/config.sqlite
@@ -45,7 +43,8 @@ clean:
 	rm -f tests/empty.sqlite 
 	rm -f tools/lemon/lemon
 	rm -f tools/m2sh/tests/tests.log 
-	find . -name "*.gc*" -exec rm {} \;
+	rm -rf release-scripts/output
+	find . \( -name "*.gcno" -o -name "*.gcda" \) -exec rm {} \;
 	${MAKE} -C tools/m2sh OPTLIB=${OPTLIB} clean
 	${MAKE} -C tools/filters OPTLIB=${OPTLIB} clean
 	${MAKE} -C tests/filters OPTLIB=${OPTLIB} clean
@@ -117,8 +116,13 @@ ragel:
 	ragel -G2 src/handler_parser.rl
 	ragel -G2 src/http11/httpclient_parser.rl
 
+%.o: %.S
+	$(CC) $(CFLAGS) -c $< -o $@
+
 valgrind:
 	VALGRIND="valgrind --log-file=/tmp/valgrind-%p.log" ${MAKE}
+strace:
+	VALGRIND="strace" ${MAKE}
 
 %.o: %.S
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -147,35 +151,41 @@ manual:
 	${MAKE} -C output/docs/manual book-final.pdf
 	${MAKE} -C output/docs/manual draft
 
-release:
-	git archive --format=tar --prefix=mongrel2-${VERSION}/ v${VERSION} | bzip2 -9 > mongrel2-${VERSION}.tar.bz2
+tarball:
+	sh maketar.sh mongrel2-${VERSION}
+
+release: tarball
+	#git archive --format=tar --prefix=mongrel2-${VERSION}/ v${VERSION} | bzip2 -9 > mongrel2-${VERSION}.tar.bz2
 	scp mongrel2-${VERSION}.tar.bz2 ${USER}@mongrel2.org:/var/www/mongrel2.org/static/downloads/
 	md5sum mongrel2-${VERSION}.tar.bz2
 	curl http://mongrel2.org/static/downloads/mongrel2-${VERSION}.tar.bz2 | md5sum
 
 netbsd: OPTFLAGS += -I/usr/local/include -I/usr/pkg/include
-netbsd: OPTLIBS += -L/usr/local/lib -L/usr/pkg/lib
-netbsd: LIBS=-lzmq -lsqlite3 $(OPTLIBS)
+netbsd: LDFLAGS += -L/usr/local/lib -L/usr/pkg/lib
+netbsd: LIBS=-lzmq -lsqlite3 $(LDFLAGS)
 netbsd: dev
 
 
 freebsd: OPTFLAGS += -I/usr/local/include
-freebsd: OPTLIBS += -L/usr/local/lib -pthread
-freebsd: LIBS=-lzmq -lsqlite3 $(OPTLIBS)
+freebsd: LDFLAGS += -L/usr/local/lib -pthread
+freebsd: LIBS=-lzmq -lsqlite3 $(LDFLAGS)
 freebsd: all
 
 openbsd: OPTFLAGS += -I/usr/local/include
-openbsd: OPTLIBS += -L/usr/local/lib -pthread
-openbsd: LIBS=-lzmq -lsqlite3 $(OPTLIBS)
+openbsd: LDFLAGS += -L/usr/local/lib -pthread
+openbsd: LIBS=-lzmq -lsqlite3 $(LDFLAGS)
 openbsd: all
 
 solaris: OPTFLAGS += -I/usr/local/include
-solaris: OPTLIBS += -L/usr/local/lib -R/usr/local/lib -lsocket -lnsl -lsendfile
-solaris: OPTLIBS += -L/lib -R/lib
+solaris: LDFLAGS += -L/usr/local/lib -R/usr/local/lib -lsocket -lnsl -lsendfile
+solaris: LDFLAGS += -L/lib -R/lib
 solaris: all
 
 
 macports: OPTFLAGS += -I/opt/local/include
-macports: OPTLIBS += -L/opt/local/lib
+macports: LDFLAGS += -L/opt/local/lib -undefined dynamic_lookup
 macports: all
 
+brew: OPTFLAGS += -I/usr/local/include
+brew: LDFLAGS += -L/usr/local/lib -undefined dynamic_lookup
+brew: all

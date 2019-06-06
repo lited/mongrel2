@@ -18,7 +18,7 @@ Features
 * N:M Messaging Patterns means you can have any N handlers answer to any M
   browsers arbitrarily, but still easy to do plain request/response.
 * Automation Loving Configs that are easily accessible via any programming
-  language with an Model-View-Controller design.
+  language with a Model-View-Controller design.
 * Modern Internal Design using the Mongrel 1 HTTP parser powering many big
   companies with a proven security track record, event based I/O, fast
   coroutines to handle that I/O, and smart reasonable defaults with zero
@@ -32,9 +32,9 @@ Features
 Download
 --------
 
-Mongrel2 is now 1.8.0 as of *Thu Jul 26 06:06 GMT 2012*: 
+mongrel2 is now v1.12.0 as of *Wed Jul 04 2018*:
 
-* [mongrel2-1.8.0.tar.bz2](https://github.com/zedshaw/mongrel2/tarball/v1.8.0) MD5: 4bca0d299e7e77efa4c674bc5877dfd0
+* [mongrel2-v1.12.0.tar.bz2](https://github.com/mongrel2/mongrel2/releases/v1.12.0/download/mongrel2-v1.12.0.tar.bz2)
 
 Documentation
 -------------

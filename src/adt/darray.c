@@ -89,7 +89,7 @@ int darray_expand(darray_t *array)
             "Failed to expand array to new size: %d",
             array->max + (int)array->expand_rate);
 
-    memset(array->contents + old_max, 0, array->expand_rate + 1);
+    memset(array->contents + old_max, 0, array->expand_rate * sizeof(void *));
     return 0;
 
 error:
@@ -143,4 +143,58 @@ error:
     return NULL;
 }
 
+int darray_insert(darray_t *array, int i, void *el)
+{
+    array->end++;
 
+    if(darray_end(array) >= darray_max(array)) {
+        if(darray_expand(array) != 0) {
+            return -1;
+        }
+    }
+
+    int n;
+    for(n = array->end - 1; n > i; n--) {
+        array->contents[n] = array->contents[n - 1];
+    }
+
+    array->contents[i] = el;
+
+    return 0;
+}
+
+void darray_move_to_end(darray_t *array, int i)
+{
+    void *el = array->contents[i];
+
+    int n;
+    for(n = i + 1; n < array->end; n++) {
+        array->contents[n - 1] = array->contents[n];
+    }
+
+    array->contents[array->end - 1] = el;
+}
+
+void darray_remove_and_resize(darray_t *array, int start, int count)
+{
+    int n;
+    if(array->element_size > 0) {
+        for(n = start; n < (start + count); n++) {
+            if(array->contents[n] != NULL) {
+                h_free(array->contents[n]);
+            }
+        }
+    }
+
+    for(n = start + count; n < array->end; n++) {
+        int i = n - (start + count);
+        array->contents[start + i] = array->contents[n];
+        array->contents[n] = NULL;
+    }
+
+    array->end = array->end - count;
+
+    if(darray_end(array) > (int)array->expand_rate && darray_end(array) % array->expand_rate) {
+        darray_contract(array);
+    }
+}
